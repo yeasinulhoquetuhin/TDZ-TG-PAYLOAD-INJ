@@ -1,0 +1,426 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+VERSION="1.1.0"
+CONFIG_FILE="/etc/tdzp.conf"
+FIREWALL_FILE="/etc/tdzp.firewall"
+SERVICE_FILE="/etc/systemd/system/tdzp.service"
+SYSCTL_FILE="/etc/sysctl.d/99-tdzp.conf"
+SELF_BIN="/usr/local/bin/tdzp"
+SERVICE_NAME="tdzp.service"
+
+if [[ -t 1 ]]; then
+    RESET=$'\033[0m'; BOLD=$'\033[1m'; RED=$'\033[38;5;196m'; GREEN=$'\033[38;5;46m'
+    YELLOW=$'\033[38;5;226m'; CYAN=$'\033[38;2;0;212;255m'; GRAY=$'\033[38;5;245m'; WHITE=$'\033[38;5;255m'
+else
+    RESET=''; BOLD=''; RED=''; GREEN=''; YELLOW=''; CYAN=''; GRAY=''; WHITE=''
+fi
+
+BOX_WIDTH=58
+repeat_char() { local char=$1 count=$2 out; printf -v out '%*s' "$count" ''; printf '%s' "${out// /$char}"; }
+center_line() {
+    local text=$1 color=${2:-$WHITE} len left right
+    len=${#text}
+    (( len > BOX_WIDTH )) && text=${text:0:BOX_WIDTH} && len=${#text}
+    left=$(( (BOX_WIDTH - len) / 2 ))
+    right=$(( BOX_WIDTH - len - left ))
+    printf '  %b║%*s%b%s%b%*s%b║%b\n' "$CYAN" "$left" '' "$color" "$text" "$RESET" "$right" '' "$CYAN" "$RESET"
+}
+banner() {
+    [[ -t 1 ]] && clear || true
+    echo
+    printf '  %b╔%s╗%b\n' "$CYAN" "$(repeat_char '═' "$BOX_WIDTH")" "$RESET"
+    center_line 'TDZ PAYLOAD PROXY' "${BOLD}${CYAN}"
+    center_line 'Powered By: t.me/TuhinBroh' "$GRAY"
+    printf '  %b╚%s╝%b\n' "$CYAN" "$(repeat_char '═' "$BOX_WIDTH")" "$RESET"
+}
+line() { printf '  %b%s%b\n' "$CYAN" "$(repeat_char '─' "$BOX_WIDTH")" "$RESET"; }
+msg() {
+    local kind=${1^^} text=$2 color mark
+    case "$kind" in
+        OK) color=$GREEN; mark='✓' ;;
+        INFO) color=$CYAN; mark='•' ;;
+        WARN) color=$YELLOW; mark='!' ;;
+        *) color=$RED; mark='✗' ;;
+    esac
+    printf '  %b%s%b %s\n' "$color" "$mark" "$RESET" "$text"
+}
+pause_screen() { echo; read -r -p '  Press Enter to continue...' _ || true; }
+require_root() { (( EUID == 0 )) || { msg error 'Run this command as root.'; exit 1; }; }
+valid_port() { [[ ${1:-} =~ ^[0-9]+$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 )); }
+config_get() { awk -F= -v k="$1" '$1==k {print $2; exit}' "$CONFIG_FILE" 2>/dev/null; }
+service_active() { systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; }
+port_listening() { command -v ss >/dev/null 2>&1 && ss -H -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:|\\])$1$"; }
+
+write_config() {
+    local public=$1 backend=$2 tmp
+    tmp=$(mktemp /etc/.tdzp.conf.XXXXXX)
+    printf 'PUBLIC_PORT=%s\nBACKEND_PORT=%s\n' "$public" "$backend" > "$tmp"
+    chmod 0600 "$tmp"
+    mv -f "$tmp" "$CONFIG_FILE"
+}
+
+write_service() {
+    cat > "$SERVICE_FILE" <<EOF_SERVICE
+[Unit]
+Description=TDZ Payload Proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=$SELF_BIN --run-proxy
+Restart=always
+RestartSec=2
+LimitNOFILE=1048576
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target
+EOF_SERVICE
+    chmod 0644 "$SERVICE_FILE"
+}
+
+apply_tuning() {
+    local bbr=''
+    modprobe tcp_bbr >/dev/null 2>&1 || true
+    if sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
+        bbr='net.ipv4.tcp_congestion_control = bbr'
+    fi
+    cat > "$SYSCTL_FILE" <<EOF_SYSCTL
+# Managed by TDZ Payload Proxy
+net.ipv4.ip_local_port_range = 10000 65535
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fastopen = 3
+net.core.default_qdisc = fq
+net.core.somaxconn = 4096
+net.ipv4.tcp_max_syn_backlog = 4096
+$bbr
+EOF_SYSCTL
+    sed -i '/^[[:space:]]*$/d' "$SYSCTL_FILE"
+    sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1 || true
+}
+
+state_get() { awk -F= -v k="$2" '$1==k {print $2; exit}' "$1" 2>/dev/null; }
+firewall_remove_from_file() {
+    local state_file=$1 method port added
+    [[ -r "$state_file" ]] || return 0
+    method=$(state_get "$state_file" METHOD)
+    port=$(state_get "$state_file" PORT)
+    added=$(state_get "$state_file" ADDED)
+    [[ "$added" == 1 && -n "$port" ]] || return 0
+    case "$method" in
+        ufw) ufw --force delete allow "$port/tcp" >/dev/null 2>&1 || true ;;
+        firewalld)
+            firewall-cmd --permanent --remove-port="$port/tcp" >/dev/null 2>&1 || true
+            firewall-cmd --reload >/dev/null 2>&1 || true
+            ;;
+        iptables) iptables -D INPUT -p tcp --dport "$port" -m comment --comment 'TDZP' -j ACCEPT >/dev/null 2>&1 || true ;;
+    esac
+}
+firewall_open() {
+    local port=$1 method=none added=0
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi '^Status: active'; then
+        method=ufw
+        if ! ufw status 2>/dev/null | grep -Eq "^${port}/tcp[[:space:]]+ALLOW"; then
+            ufw allow "$port/tcp" comment 'TDZP' >/dev/null
+            added=1
+        fi
+    elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+        method=firewalld
+        if ! firewall-cmd --permanent --query-port="$port/tcp" >/dev/null 2>&1; then
+            firewall-cmd --permanent --add-port="$port/tcp" >/dev/null
+            firewall-cmd --reload >/dev/null
+            added=1
+        fi
+    elif command -v iptables >/dev/null 2>&1; then
+        method=iptables
+        if ! iptables -C INPUT -p tcp --dport "$port" -m comment --comment 'TDZP' -j ACCEPT >/dev/null 2>&1; then
+            iptables -I INPUT -p tcp --dport "$port" -m comment --comment 'TDZP' -j ACCEPT
+            added=1
+        fi
+    fi
+    printf 'METHOD=%s\nPORT=%s\nADDED=%s\n' "$method" "$port" "$added" > "$FIREWALL_FILE"
+    chmod 0600 "$FIREWALL_FILE"
+}
+
+setup_proxy() {
+    require_root
+    local public=${1:-} backend=${2:-}
+    valid_port "$public" || { msg error 'Invalid public port.'; exit 1; }
+    valid_port "$backend" || { msg error 'Invalid backend port.'; exit 1; }
+    [[ "$public" != "$backend" ]] || { msg error 'Public and backend ports must be different.'; exit 1; }
+
+    local old_state=''
+    old_state=$(mktemp)
+    [[ -r "$FIREWALL_FILE" ]] && cp -f "$FIREWALL_FILE" "$old_state" || : > "$old_state"
+
+    systemctl disable --now "$SERVICE_NAME" >/dev/null 2>&1 || true
+    firewall_remove_from_file "$old_state"
+    write_config "$public" "$backend"
+    write_service
+    apply_tuning
+    firewall_open "$public"
+    systemctl daemon-reload
+    systemctl enable --now "$SERVICE_NAME" >/dev/null
+    sleep 1
+    rm -f "$old_state"
+
+    service_active || { msg error 'Proxy service failed to start.'; journalctl -u "$SERVICE_NAME" -n 12 --no-pager 2>/dev/null || true; exit 1; }
+}
+
+run_proxy() {
+    local public backend
+    public=$(config_get PUBLIC_PORT)
+    backend=$(config_get BACKEND_PORT)
+    valid_port "$public" && valid_port "$backend" || exit 1
+
+    exec python3 - "$public" "$backend" <<'PYTHON_PROXY'
+import asyncio
+import contextlib
+import signal
+import socket
+import sys
+
+PUBLIC_PORT = int(sys.argv[1])
+BACKEND_PORT = int(sys.argv[2])
+HEADER_END = b"\r\n\r\n"
+RESPONSE = (
+    b"HTTP/1.1 101 Switching Protocols\r\n"
+    b"Upgrade: websocket\r\n"
+    b"Connection: Upgrade\r\n\r\n"
+)
+
+
+def tune(writer):
+    sock = writer.get_extra_info("socket")
+    if sock is None:
+        return
+    with contextlib.suppress(OSError):
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    with contextlib.suppress(OSError):
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+
+
+async def close(writer):
+    if writer is None:
+        return
+    writer.close()
+    with contextlib.suppress(Exception):
+        await writer.wait_closed()
+
+
+async def read_header(reader):
+    data = bytearray()
+    while HEADER_END not in data:
+        if len(data) >= 65536:
+            raise ValueError("header too large")
+        chunk = await asyncio.wait_for(reader.read(4096), timeout=8)
+        if not chunk:
+            raise ConnectionError("incomplete header")
+        data.extend(chunk)
+    end = data.index(HEADER_END) + 4
+    return bytes(data[end:])
+
+
+async def relay(reader, writer):
+    try:
+        while True:
+            data = await reader.read(65536)
+            if not data:
+                break
+            writer.write(data)
+            await writer.drain()
+    except (ConnectionError, OSError, asyncio.CancelledError):
+        pass
+
+
+async def client_handler(client_reader, client_writer):
+    backend_writer = None
+    try:
+        tune(client_writer)
+        pending = await read_header(client_reader)
+        backend_reader, backend_writer = await asyncio.open_connection("127.0.0.1", BACKEND_PORT)
+        tune(backend_writer)
+        client_writer.write(RESPONSE)
+        await client_writer.drain()
+        if pending:
+            backend_writer.write(pending)
+            await backend_writer.drain()
+        tasks = {
+            asyncio.create_task(relay(client_reader, backend_writer)),
+            asyncio.create_task(relay(backend_reader, client_writer)),
+        }
+        done, pending_tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task in pending_tasks:
+            task.cancel()
+        await asyncio.gather(*done, *pending_tasks, return_exceptions=True)
+    except (asyncio.TimeoutError, ConnectionError, OSError, ValueError):
+        pass
+    finally:
+        await close(backend_writer)
+        await close(client_writer)
+
+
+async def main():
+    server = await asyncio.start_server(
+        client_handler,
+        "0.0.0.0",
+        PUBLIC_PORT,
+        backlog=512,
+        reuse_address=True,
+        limit=131072,
+    )
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        with contextlib.suppress(NotImplementedError):
+            loop.add_signal_handler(sig, stop.set)
+    async with server:
+        await stop.wait()
+
+
+asyncio.run(main())
+PYTHON_PROXY
+}
+
+change_port() {
+    local type=$1 old_public old_backend new_port old_state
+    old_public=$(config_get PUBLIC_PORT)
+    old_backend=$(config_get BACKEND_PORT)
+    banner
+    echo
+    if [[ "$type" == public ]]; then
+        msg info "Current public port: $old_public"
+        read -r -p '  Enter new public port: ' new_port
+        valid_port "$new_port" || { msg error 'Invalid port.'; pause_screen; return; }
+        [[ "$new_port" != "$old_backend" ]] || { msg error 'Public and backend ports must be different.'; pause_screen; return; }
+    else
+        msg info "Current backend port: $old_backend"
+        read -r -p '  Enter new backend port: ' new_port
+        valid_port "$new_port" || { msg error 'Invalid port.'; pause_screen; return; }
+        [[ "$new_port" != "$old_public" ]] || { msg error 'Public and backend ports must be different.'; pause_screen; return; }
+    fi
+
+    old_state=$(mktemp)
+    [[ -r "$FIREWALL_FILE" ]] && cp -f "$FIREWALL_FILE" "$old_state" || : > "$old_state"
+
+    if [[ "$type" == public ]]; then
+        systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
+        firewall_remove_from_file "$old_state"
+        write_config "$new_port" "$old_backend"
+        firewall_open "$new_port"
+    else
+        systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
+        write_config "$old_public" "$new_port"
+    fi
+
+    if systemctl restart "$SERVICE_NAME" >/dev/null 2>&1 && sleep 1 && service_active; then
+        rm -f "$old_state"
+        msg ok "${type^} port changed to $new_port."
+    else
+        msg error 'Change failed. Restoring previous settings.'
+        if [[ "$type" == public ]]; then
+            firewall_remove_from_file "$FIREWALL_FILE"
+            cp -f "$old_state" "$FIREWALL_FILE"
+            firewall_open "$old_public" >/dev/null 2>&1 || true
+        fi
+        write_config "$old_public" "$old_backend"
+        systemctl restart "$SERVICE_NAME" >/dev/null 2>&1 || true
+        rm -f "$old_state"
+    fi
+    pause_screen
+}
+
+show_status() {
+    local public backend state listener backend_state
+    public=$(config_get PUBLIC_PORT)
+    backend=$(config_get BACKEND_PORT)
+    if service_active; then state="${GREEN}ACTIVE${RESET}"; else state="${RED}INACTIVE${RESET}"; fi
+    if port_listening "$public"; then listener="${GREEN}LISTENING${RESET}"; else listener="${RED}NOT LISTENING${RESET}"; fi
+    if port_listening "$backend"; then backend_state="${GREEN}AVAILABLE${RESET}"; else backend_state="${YELLOW}NOT DETECTED${RESET}"; fi
+
+    banner
+    echo
+    line
+    printf '  %-22s %b\n' 'Service Status:' "$state"
+    printf '  %-22s %s\n' 'Public Port:' "$public"
+    printf '  %-22s %s\n' 'Backend Port:' "$backend"
+    printf '  %-22s %b\n' 'Public Listener:' "$listener"
+    printf '  %-22s %b\n' 'Backend Listener:' "$backend_state"
+    printf '  %-22s %s\n' 'Version:' "$VERSION"
+    line
+    echo
+    systemctl status "$SERVICE_NAME" --no-pager -l 2>/dev/null | sed -n '1,8p' || true
+    pause_screen
+}
+
+uninstall_proxy() {
+    banner
+    echo
+    msg warn 'This will remove TDZ Payload Proxy completely.'
+    read -r -p '  Type YES to continue: ' answer
+    [[ "$answer" == YES ]] || { msg info 'Uninstall cancelled.'; pause_screen; return; }
+
+    echo
+    printf '  [1/4] Stopping service... '
+    systemctl disable --now "$SERVICE_NAME" >/dev/null 2>&1 || true
+    printf '%bDONE%b\n' "$GREEN" "$RESET"
+    printf '  [2/4] Removing firewall rule... '
+    firewall_remove_from_file "$FIREWALL_FILE"
+    printf '%bDONE%b\n' "$GREEN" "$RESET"
+    printf '  [3/4] Removing settings... '
+    rm -f "$SERVICE_FILE" "$CONFIG_FILE" "$FIREWALL_FILE" "$SYSCTL_FILE"
+    sysctl --system >/dev/null 2>&1 || true
+    printf '%bDONE%b\n' "$GREEN" "$RESET"
+    printf '  [4/4] Removing command... '
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    rm -f "$SELF_BIN"
+    printf '%bDONE%b\n' "$GREEN" "$RESET"
+    echo
+    msg ok 'TDZ Payload Proxy has been uninstalled.'
+    exit 0
+}
+
+menu() {
+    require_root
+    [[ -r "$CONFIG_FILE" ]] || { msg error 'TDZ Payload Proxy is not installed.'; exit 1; }
+    while true; do
+        local public backend state choice
+        public=$(config_get PUBLIC_PORT)
+        backend=$(config_get BACKEND_PORT)
+        if service_active; then state="${GREEN}ACTIVE${RESET}"; else state="${RED}INACTIVE${RESET}"; fi
+        banner
+        echo
+        printf '  Service: %b   Public: %s   Backend: %s\n' "$state" "$public" "$backend"
+        line
+        printf '  %b[1]%b Edit Public Port\n' "$CYAN" "$RESET"
+        printf '  %b[2]%b Edit Backend Port\n' "$CYAN" "$RESET"
+        printf '  %b[3]%b View Status\n' "$CYAN" "$RESET"
+        printf '  %b[0]%b Exit\n' "$GRAY" "$RESET"
+        line
+        printf '  %b[99]%b Uninstall\n' "$RED" "$RESET"
+        echo
+        read -r -p '  Select option: ' choice
+        case "$choice" in
+            1) change_port public ;;
+            2) change_port backend ;;
+            3) show_status ;;
+            99) uninstall_proxy ;;
+            0) exit 0 ;;
+            *) msg error 'Invalid option.'; sleep 1 ;;
+        esac
+    done
+}
+
+case "${1:-}" in
+    --run-proxy) run_proxy ;;
+    --setup) shift; setup_proxy "${1:-}" "${2:-}" ;;
+    --status) require_root; show_status ;;
+    --version) printf 'TDZ Payload Proxy %s\n' "$VERSION" ;;
+    '') menu ;;
+    *) printf 'Usage: tdzp [--status|--version]\n' >&2; exit 2 ;;
+esac
