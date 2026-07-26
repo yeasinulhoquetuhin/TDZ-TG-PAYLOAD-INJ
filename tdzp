@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="1.1.0"
-CONFIG_FILE="/etc/tdzp.conf"
-FIREWALL_FILE="/etc/tdzp.firewall"
-SERVICE_FILE="/etc/systemd/system/tdzp.service"
-SYSCTL_FILE="/etc/sysctl.d/99-tdzp.conf"
-SELF_BIN="/usr/local/bin/tdzp"
-SERVICE_NAME="tdzp.service"
+VERSION="1.2.0"
+BASE_DIR="${TDZP_BASE_DIR:-/etc/tdzp}"
+INSTANCES_DIR="$BASE_DIR/instances"
+FIREWALL_DIR="$BASE_DIR/firewall"
+COUNTER_FILE="$BASE_DIR/next-id"
+SERVICE_FILE="${TDZP_SERVICE_FILE:-/etc/systemd/system/tdzp@.service}"
+SYSCTL_FILE="${TDZP_SYSCTL_FILE:-/etc/sysctl.d/99-tdzp.conf}"
+SELF_BIN="${TDZP_SELF_BIN:-/usr/local/bin/tdzp}"
+LEGACY_CONFIG="${TDZP_LEGACY_CONFIG:-/etc/tdzp.conf}"
+LEGACY_FIREWALL="${TDZP_LEGACY_FIREWALL:-/etc/tdzp.firewall}"
+LEGACY_SERVICE="${TDZP_LEGACY_SERVICE:-/etc/systemd/system/tdzp.service}"
 
 if [[ -t 1 ]]; then
     RESET=$'\033[0m'; BOLD=$'\033[1m'; RED=$'\033[38;5;196m'; GREEN=$'\033[38;5;46m'
@@ -48,28 +52,88 @@ msg() {
 pause_screen() { echo; read -r -p '  Press Enter to continue...' _ || true; }
 require_root() { (( EUID == 0 )) || { msg error 'Run this command as root.'; exit 1; }; }
 valid_port() { [[ ${1:-} =~ ^[0-9]+$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 )); }
-config_get() { awk -F= -v k="$1" '$1==k {print $2; exit}' "$CONFIG_FILE" 2>/dev/null; }
-service_active() { systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; }
-port_listening() { command -v ss >/dev/null 2>&1 && ss -H -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:|\\])$1$"; }
 
-write_config() {
-    local public=$1 backend=$2 tmp
-    tmp=$(mktemp /etc/.tdzp.conf.XXXXXX)
+ensure_layout() {
+    install -d -m 0755 "$BASE_DIR" "$INSTANCES_DIR" "$FIREWALL_DIR"
+}
+instance_file() { printf '%s/%s.conf' "$INSTANCES_DIR" "$1"; }
+firewall_file() { printf '%s/%s.state' "$FIREWALL_DIR" "$1"; }
+service_name() { printf 'tdzp@%s.service' "$1"; }
+instance_exists() { [[ -r "$(instance_file "$1")" ]]; }
+instance_get() {
+    local id=$1 key=$2
+    awk -F= -v k="$key" '$1==k {print $2; exit}' "$(instance_file "$id")" 2>/dev/null
+}
+instance_ids() {
+    [[ -d "$INSTANCES_DIR" ]] || return 0
+    find "$INSTANCES_DIR" -maxdepth 1 -type f -name '*.conf' -printf '%f\n' 2>/dev/null \
+        | sed 's/\.conf$//' | grep -E '^[0-9]+$' | sort -n
+}
+instance_count() { instance_ids | awk 'END {print NR+0}'; }
+active_count() {
+    local id count=0
+    while IFS= read -r id; do
+        [[ -n "$id" ]] || continue
+        systemctl is-active --quiet "$(service_name "$id")" 2>/dev/null && count=$((count + 1)) || true
+    done < <(instance_ids)
+    printf '%s\n' "$count"
+}
+service_active() { systemctl is-active --quiet "$(service_name "$1")" 2>/dev/null; }
+port_listening() {
+    command -v ss >/dev/null 2>&1 && ss -H -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:|\\])$1$"
+}
+public_port_owner() {
+    local wanted=$1 exclude=${2:-} id port
+    while IFS= read -r id; do
+        [[ -n "$id" && "$id" != "$exclude" ]] || continue
+        port=$(instance_get "$id" PUBLIC_PORT)
+        [[ "$port" == "$wanted" ]] && { printf '%s\n' "$id"; return 0; }
+    done < <(instance_ids)
+    return 1
+}
+validate_pair() {
+    local public=$1 backend=$2 exclude=${3:-} owner
+    valid_port "$public" || { msg error 'Invalid public port. Use 1-65535.'; return 1; }
+    valid_port "$backend" || { msg error 'Invalid backend port. Use 1-65535.'; return 1; }
+    [[ "$public" != "$backend" ]] || { msg error 'Public and backend ports must be different.'; return 1; }
+    owner=$(public_port_owner "$public" "$exclude" 2>/dev/null || true)
+    [[ -z "$owner" ]] || { msg error "Public port $public is already used by Proxy #$owner."; return 1; }
+    owner=$(public_port_owner "$backend" "$exclude" 2>/dev/null || true)
+    [[ -z "$owner" ]] || { msg error "Backend port $backend is a TDZ public port on Proxy #$owner."; return 1; }
+    return 0
+}
+write_instance() {
+    local id=$1 public=$2 backend=$3 tmp
+    ensure_layout
+    tmp=$(mktemp "$INSTANCES_DIR/.${id}.XXXXXX")
     printf 'PUBLIC_PORT=%s\nBACKEND_PORT=%s\n' "$public" "$backend" > "$tmp"
     chmod 0600 "$tmp"
-    mv -f "$tmp" "$CONFIG_FILE"
+    mv -f "$tmp" "$(instance_file "$id")"
 }
-
-write_service() {
+next_instance_id() {
+    local next=1 last
+    if [[ -r "$COUNTER_FILE" ]]; then
+        read -r next < "$COUNTER_FILE" || next=1
+    else
+        last=$(instance_ids | tail -n 1)
+        [[ -n "$last" ]] && next=$((last + 1))
+    fi
+    while instance_exists "$next"; do next=$((next + 1)); done
+    printf '%s\n' "$((next + 1))" > "$COUNTER_FILE"
+    chmod 0600 "$COUNTER_FILE"
+    printf '%s\n' "$next"
+}
+write_service_template() {
+    local escaped_self=${SELF_BIN//%/%%}
     cat > "$SERVICE_FILE" <<EOF_SERVICE
 [Unit]
-Description=TDZ Payload Proxy
+Description=TDZ Payload Proxy #%i
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=$SELF_BIN --run-proxy
+ExecStart=$escaped_self --run-proxy %i
 Restart=always
 RestartSec=2
 LimitNOFILE=1048576
@@ -83,7 +147,6 @@ WantedBy=multi-user.target
 EOF_SERVICE
     chmod 0644 "$SERVICE_FILE"
 }
-
 apply_tuning() {
     local bbr=''
     modprobe tcp_bbr >/dev/null 2>&1 || true
@@ -103,30 +166,35 @@ EOF_SYSCTL
     sed -i '/^[[:space:]]*$/d' "$SYSCTL_FILE"
     sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1 || true
 }
-
 state_get() { awk -F= -v k="$2" '$1==k {print $2; exit}' "$1" 2>/dev/null; }
-firewall_remove_from_file() {
-    local state_file=$1 method port added
+firewall_remove_state() {
+    local state_file=$1 legacy=${2:-0} method port added comment
     [[ -r "$state_file" ]] || return 0
     method=$(state_get "$state_file" METHOD)
     port=$(state_get "$state_file" PORT)
     added=$(state_get "$state_file" ADDED)
-    [[ "$added" == 1 && -n "$port" ]] || return 0
+    [[ "$added" == 1 && -n "$port" ]] || { rm -f "$state_file"; return 0; }
+    comment='TDZP'
+    [[ "$legacy" == 0 ]] && comment="TDZP:$(basename "$state_file" .state)"
     case "$method" in
         ufw) ufw --force delete allow "$port/tcp" >/dev/null 2>&1 || true ;;
         firewalld)
             firewall-cmd --permanent --remove-port="$port/tcp" >/dev/null 2>&1 || true
             firewall-cmd --reload >/dev/null 2>&1 || true
             ;;
-        iptables) iptables -D INPUT -p tcp --dport "$port" -m comment --comment 'TDZP' -j ACCEPT >/dev/null 2>&1 || true ;;
+        iptables) iptables -D INPUT -p tcp --dport "$port" -m comment --comment "$comment" -j ACCEPT >/dev/null 2>&1 || true ;;
     esac
+    rm -f "$state_file"
 }
+firewall_remove() { firewall_remove_state "$(firewall_file "$1")" 0; }
 firewall_open() {
-    local port=$1 method=none added=0
+    local id=$1 port=$2 method=none added=0 state_file
+    state_file=$(firewall_file "$id")
+    ensure_layout
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi '^Status: active'; then
         method=ufw
         if ! ufw status 2>/dev/null | grep -Eq "^${port}/tcp[[:space:]]+ALLOW"; then
-            ufw allow "$port/tcp" comment 'TDZP' >/dev/null
+            ufw allow "$port/tcp" comment "TDZP:$id" >/dev/null
             added=1
         fi
     elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
@@ -138,44 +206,67 @@ firewall_open() {
         fi
     elif command -v iptables >/dev/null 2>&1; then
         method=iptables
-        if ! iptables -C INPUT -p tcp --dport "$port" -m comment --comment 'TDZP' -j ACCEPT >/dev/null 2>&1; then
-            iptables -I INPUT -p tcp --dport "$port" -m comment --comment 'TDZP' -j ACCEPT
+        if ! iptables -C INPUT -p tcp --dport "$port" -m comment --comment "TDZP:$id" -j ACCEPT >/dev/null 2>&1; then
+            iptables -I INPUT -p tcp --dport "$port" -m comment --comment "TDZP:$id" -j ACCEPT
             added=1
         fi
     fi
-    printf 'METHOD=%s\nPORT=%s\nADDED=%s\n' "$method" "$port" "$added" > "$FIREWALL_FILE"
-    chmod 0600 "$FIREWALL_FILE"
+    printf 'METHOD=%s\nPORT=%s\nADDED=%s\n' "$method" "$port" "$added" > "$state_file"
+    chmod 0600 "$state_file"
 }
-
-setup_proxy() {
+prepare_system() {
     require_root
-    local public=${1:-} backend=${2:-}
-    valid_port "$public" || { msg error 'Invalid public port.'; exit 1; }
-    valid_port "$backend" || { msg error 'Invalid backend port.'; exit 1; }
-    [[ "$public" != "$backend" ]] || { msg error 'Public and backend ports must be different.'; exit 1; }
-
-    local old_state=''
-    old_state=$(mktemp)
-    [[ -r "$FIREWALL_FILE" ]] && cp -f "$FIREWALL_FILE" "$old_state" || : > "$old_state"
-
-    systemctl disable --now "$SERVICE_NAME" >/dev/null 2>&1 || true
-    firewall_remove_from_file "$old_state"
-    write_config "$public" "$backend"
-    write_service
+    ensure_layout
+    write_service_template
     apply_tuning
-    firewall_open "$public"
-    systemctl daemon-reload
-    systemctl enable --now "$SERVICE_NAME" >/dev/null
-    sleep 1
-    rm -f "$old_state"
-
-    service_active || { msg error 'Proxy service failed to start.'; journalctl -u "$SERVICE_NAME" -n 12 --no-pager 2>/dev/null || true; exit 1; }
+    systemctl daemon-reload >/dev/null 2>&1 || true
 }
-
-run_proxy() {
+create_instance() {
+    require_root
+    local public=${1:-} backend=${2:-} id service
+    validate_pair "$public" "$backend" || return 1
+    if port_listening "$public"; then
+        msg error "Public port $public is already listening on this server."
+        return 1
+    fi
+    prepare_system
+    id=$(next_instance_id)
+    service=$(service_name "$id")
+    write_instance "$id" "$public" "$backend"
+    firewall_open "$id" "$public"
+    if systemctl enable --now "$service" >/dev/null 2>&1 && sleep 1 && service_active "$id"; then
+        CREATED_ID=$id
+        return 0
+    fi
+    systemctl disable --now "$service" >/dev/null 2>&1 || true
+    firewall_remove "$id"
+    rm -f "$(instance_file "$id")"
+    msg error "Proxy #$id failed to start."
+    journalctl -u "$service" -n 12 --no-pager 2>/dev/null || true
+    return 1
+}
+migrate_legacy() {
+    require_root
+    ensure_layout
+    [[ -r "$LEGACY_CONFIG" ]] || return 0
+    if (( $(instance_count) > 0 )); then
+        return 0
+    fi
     local public backend
-    public=$(config_get PUBLIC_PORT)
-    backend=$(config_get BACKEND_PORT)
+    public=$(awk -F= '$1=="PUBLIC_PORT" {print $2; exit}' "$LEGACY_CONFIG" 2>/dev/null)
+    backend=$(awk -F= '$1=="BACKEND_PORT" {print $2; exit}' "$LEGACY_CONFIG" 2>/dev/null)
+    validate_pair "$public" "$backend" || return 1
+    systemctl disable --now tdzp.service >/dev/null 2>&1 || true
+    firewall_remove_state "$LEGACY_FIREWALL" 1
+    rm -f "$LEGACY_SERVICE" "$LEGACY_CONFIG" "$LEGACY_FIREWALL"
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    create_instance "$public" "$backend"
+}
+run_proxy() {
+    local id=${1:-} public backend
+    instance_exists "$id" || exit 1
+    public=$(instance_get "$id" PUBLIC_PORT)
+    backend=$(instance_get "$id" BACKEND_PORT)
     valid_port "$public" && valid_port "$backend" || exit 1
 
     exec python3 - "$public" "$backend" <<'PYTHON_PROXY'
@@ -286,129 +377,253 @@ async def main():
 asyncio.run(main())
 PYTHON_PROXY
 }
-
-change_port() {
-    local type=$1 old_public old_backend new_port old_state
-    old_public=$(config_get PUBLIC_PORT)
-    old_backend=$(config_get BACKEND_PORT)
+card_row() {
+    local label=$1 value=$2 color=${3:-$WHITE} used pad
+    used=$((2 + 18 + 1 + ${#value}))
+    pad=$((BOX_WIDTH - used))
+    (( pad < 0 )) && pad=0
+    printf '  %b│%b  %-18s %b%s%b%*s%b│%b\n' \
+        "$CYAN" "$RESET" "$label" "$color" "$value" "$RESET" "$pad" '' "$CYAN" "$RESET"
+}
+show_proxy_card() {
+    local id=$1 public backend status status_color listener listener_color backend_state backend_color title fill
+    public=$(instance_get "$id" PUBLIC_PORT)
+    backend=$(instance_get "$id" BACKEND_PORT)
+    if service_active "$id"; then status='ACTIVE'; status_color=$GREEN; else status='INACTIVE'; status_color=$RED; fi
+    if port_listening "$public"; then listener='LISTENING'; listener_color=$GREEN; else listener='NOT LISTENING'; listener_color=$RED; fi
+    if port_listening "$backend"; then backend_state='AVAILABLE'; backend_color=$GREEN; else backend_state='NOT DETECTED'; backend_color=$YELLOW; fi
+    title=" Proxy #$id "
+    fill=$((BOX_WIDTH - ${#title}))
+    (( fill < 0 )) && fill=0
+    printf '  %b┌%s%s┐%b\n' "$CYAN" "$title" "$(repeat_char '─' "$fill")" "$RESET"
+    card_row 'Public Port:' "$public" "$WHITE"
+    card_row 'Backend Port:' "$backend" "$WHITE"
+    card_row 'Service Status:' "$status" "$status_color"
+    card_row 'Public Listener:' "$listener" "$listener_color"
+    card_row 'Backend Listener:' "$backend_state" "$backend_color"
+    printf '  %b└%s┘%b\n' "$CYAN" "$(repeat_char '─' "$BOX_WIDTH")" "$RESET"
+}
+prompt_pair() {
+    local public backend
+    while true; do
+        read -r -p '  Select Public Port: ' public
+        valid_port "$public" || { msg error 'Invalid port. Use 1-65535.'; continue; }
+        break
+    done
+    while true; do
+        read -r -p '  Select Backend Port: ' backend
+        valid_port "$backend" || { msg error 'Invalid port. Use 1-65535.'; continue; }
+        validate_pair "$public" "$backend" || continue
+        break
+    done
+    SELECTED_PUBLIC=$public
+    SELECTED_BACKEND=$backend
+}
+create_proxy_screen() {
     banner
     echo
-    if [[ "$type" == public ]]; then
-        msg info "Current public port: $old_public"
-        read -r -p '  Enter new public port: ' new_port
-        valid_port "$new_port" || { msg error 'Invalid port.'; pause_screen; return; }
-        [[ "$new_port" != "$old_backend" ]] || { msg error 'Public and backend ports must be different.'; pause_screen; return; }
+    msg info 'Create a new public-to-backend proxy.'
+    echo
+    prompt_pair
+    echo
+    printf '  Creating proxy... '
+    if create_instance "$SELECTED_PUBLIC" "$SELECTED_BACKEND"; then
+        printf '%bDONE%b\n' "$GREEN" "$RESET"
+        msg ok "Proxy #$CREATED_ID created: $SELECTED_PUBLIC → $SELECTED_BACKEND"
     else
-        msg info "Current backend port: $old_backend"
-        read -r -p '  Enter new backend port: ' new_port
-        valid_port "$new_port" || { msg error 'Invalid port.'; pause_screen; return; }
-        [[ "$new_port" != "$old_public" ]] || { msg error 'Public and backend ports must be different.'; pause_screen; return; }
+        printf '%bFAILED%b\n' "$RED" "$RESET"
     fi
+    pause_screen
+}
+edit_public_port() {
+    local id=$1 old_public backend new_public service
+    old_public=$(instance_get "$id" PUBLIC_PORT)
+    backend=$(instance_get "$id" BACKEND_PORT)
+    service=$(service_name "$id")
+    banner; echo; msg info "Current public port: $old_public"
+    read -r -p '  Enter new public port: ' new_public
+    validate_pair "$new_public" "$backend" "$id" || { pause_screen; return; }
+    [[ "$new_public" == "$old_public" ]] && { msg info 'Port is unchanged.'; pause_screen; return; }
+    if port_listening "$new_public"; then msg error "Port $new_public is already listening."; pause_screen; return; fi
 
-    old_state=$(mktemp)
-    [[ -r "$FIREWALL_FILE" ]] && cp -f "$FIREWALL_FILE" "$old_state" || : > "$old_state"
-
-    if [[ "$type" == public ]]; then
-        systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
-        firewall_remove_from_file "$old_state"
-        write_config "$new_port" "$old_backend"
-        firewall_open "$new_port"
+    systemctl stop "$service" >/dev/null 2>&1 || true
+    firewall_remove "$id"
+    write_instance "$id" "$new_public" "$backend"
+    firewall_open "$id" "$new_public"
+    if systemctl restart "$service" >/dev/null 2>&1 && sleep 1 && service_active "$id"; then
+        msg ok "Public port changed to $new_public."
     else
-        systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
-        write_config "$old_public" "$new_port"
+        msg error 'Change failed. Restoring previous port.'
+        firewall_remove "$id"
+        write_instance "$id" "$old_public" "$backend"
+        firewall_open "$id" "$old_public"
+        systemctl restart "$service" >/dev/null 2>&1 || true
     fi
-
-    if systemctl restart "$SERVICE_NAME" >/dev/null 2>&1 && sleep 1 && service_active; then
-        rm -f "$old_state"
-        msg ok "${type^} port changed to $new_port."
+    pause_screen
+}
+edit_backend_port() {
+    local id=$1 public old_backend new_backend service
+    public=$(instance_get "$id" PUBLIC_PORT)
+    old_backend=$(instance_get "$id" BACKEND_PORT)
+    service=$(service_name "$id")
+    banner; echo; msg info "Current backend port: $old_backend"
+    read -r -p '  Enter new backend port: ' new_backend
+    validate_pair "$public" "$new_backend" "$id" || { pause_screen; return; }
+    [[ "$new_backend" == "$old_backend" ]] && { msg info 'Port is unchanged.'; pause_screen; return; }
+    write_instance "$id" "$public" "$new_backend"
+    if systemctl restart "$service" >/dev/null 2>&1 && sleep 1 && service_active "$id"; then
+        msg ok "Backend port changed to $new_backend."
     else
-        msg error 'Change failed. Restoring previous settings.'
-        if [[ "$type" == public ]]; then
-            firewall_remove_from_file "$FIREWALL_FILE"
-            cp -f "$old_state" "$FIREWALL_FILE"
-            firewall_open "$old_public" >/dev/null 2>&1 || true
+        msg error 'Change failed. Restoring previous port.'
+        write_instance "$id" "$public" "$old_backend"
+        systemctl restart "$service" >/dev/null 2>&1 || true
+    fi
+    pause_screen
+}
+restart_instance() {
+    local id=$1
+    banner; echo
+    printf '  Restarting Proxy #%s... ' "$id"
+    if systemctl restart "$(service_name "$id")" >/dev/null 2>&1 && sleep 1 && service_active "$id"; then
+        printf '%bDONE%b\n' "$GREEN" "$RESET"
+    else
+        printf '%bFAILED%b\n' "$RED" "$RESET"
+        journalctl -u "$(service_name "$id")" -n 10 --no-pager 2>/dev/null || true
+    fi
+    pause_screen
+}
+delete_instance() {
+    local id=$1 answer
+    banner; echo; show_proxy_card "$id"; echo
+    msg warn "Proxy #$id will be removed."
+    read -r -p '  Type DELETE to continue: ' answer
+    [[ "$answer" == DELETE ]] || { msg info 'Delete cancelled.'; pause_screen; return; }
+    systemctl disable --now "$(service_name "$id")" >/dev/null 2>&1 || true
+    firewall_remove "$id"
+    rm -f "$(instance_file "$id")"
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    msg ok "Proxy #$id deleted."
+    pause_screen
+}
+manage_instance() {
+    local id=$1 choice
+    while instance_exists "$id"; do
+        banner; echo; show_proxy_card "$id"; echo
+        printf '  %b[1]%b Edit Public Port\n' "$CYAN" "$RESET"
+        printf '  %b[2]%b Edit Backend Port\n' "$CYAN" "$RESET"
+        printf '  %b[3]%b Restart Proxy\n' "$CYAN" "$RESET"
+        printf '  %b[4]%b Delete Proxy\n' "$RED" "$RESET"
+        printf '  %b[0]%b Back\n' "$GRAY" "$RESET"
+        echo
+        read -r -p '  Select option: ' choice
+        case "$choice" in
+            1) edit_public_port "$id" ;;
+            2) edit_backend_port "$id" ;;
+            3) restart_instance "$id" ;;
+            4) delete_instance "$id" ;;
+            0) return ;;
+            *) msg error 'Invalid option.'; sleep 1 ;;
+        esac
+    done
+}
+proxy_list_screen() {
+    local choice id found
+    while true; do
+        banner; echo
+        if (( $(instance_count) == 0 )); then
+            msg warn 'No proxy has been created yet.'
+            pause_screen
+            return
         fi
-        write_config "$old_public" "$old_backend"
-        systemctl restart "$SERVICE_NAME" >/dev/null 2>&1 || true
-        rm -f "$old_state"
+        while IFS= read -r id; do
+            [[ -n "$id" ]] || continue
+            show_proxy_card "$id"
+            echo
+        done < <(instance_ids)
+        read -r -p '  Select Proxy Number (0 = Back): ' choice
+        [[ "$choice" == 0 ]] && return
+        if [[ "$choice" =~ ^[0-9]+$ ]] && instance_exists "$choice"; then
+            manage_instance "$choice"
+        else
+            msg error 'Invalid proxy number.'
+            sleep 1
+        fi
+    done
+}
+spinner_run() {
+    local label=$1; shift
+    local frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏') i=0 pid status
+    "$@" >/dev/null 2>&1 & pid=$!
+    if [[ -t 1 ]]; then
+        while kill -0 "$pid" 2>/dev/null; do
+            printf '\r  %b%s%b %-36s' "$CYAN" "${frames[$i]}" "$RESET" "$label"
+            i=$(( (i + 1) % ${#frames[@]} ))
+            sleep 0.08
+        done
     fi
-    pause_screen
+    if wait "$pid"; then status=0; else status=$?; fi
+    if [[ -t 1 ]]; then
+        printf '\r  %b✓%b %-36s %bDONE%b\n' "$GREEN" "$RESET" "$label" "$GREEN" "$RESET"
+    fi
+    return "$status"
 }
-
-show_status() {
-    local public backend state listener backend_state
-    public=$(config_get PUBLIC_PORT)
-    backend=$(config_get BACKEND_PORT)
-    if service_active; then state="${GREEN}ACTIVE${RESET}"; else state="${RED}INACTIVE${RESET}"; fi
-    if port_listening "$public"; then listener="${GREEN}LISTENING${RESET}"; else listener="${RED}NOT LISTENING${RESET}"; fi
-    if port_listening "$backend"; then backend_state="${GREEN}AVAILABLE${RESET}"; else backend_state="${YELLOW}NOT DETECTED${RESET}"; fi
-
-    banner
-    echo
-    line
-    printf '  %-22s %b\n' 'Service Status:' "$state"
-    printf '  %-22s %s\n' 'Public Port:' "$public"
-    printf '  %-22s %s\n' 'Backend Port:' "$backend"
-    printf '  %-22s %b\n' 'Public Listener:' "$listener"
-    printf '  %-22s %b\n' 'Backend Listener:' "$backend_state"
-    printf '  %-22s %s\n' 'Version:' "$VERSION"
-    line
-    echo
-    systemctl status "$SERVICE_NAME" --no-pager -l 2>/dev/null | sed -n '1,8p' || true
-    pause_screen
+uninstall_stop_all() {
+    local id
+    while IFS= read -r id; do
+        [[ -n "$id" ]] || continue
+        systemctl disable --now "$(service_name "$id")" >/dev/null 2>&1 || true
+    done < <(instance_ids)
+    systemctl disable --now tdzp.service >/dev/null 2>&1 || true
 }
-
+uninstall_firewalls() {
+    local id
+    while IFS= read -r id; do [[ -n "$id" ]] && firewall_remove "$id"; done < <(instance_ids)
+    firewall_remove_state "$LEGACY_FIREWALL" 1
+}
+uninstall_settings() {
+    rm -rf "$BASE_DIR"
+    rm -f "$SERVICE_FILE" "$LEGACY_SERVICE" "$LEGACY_CONFIG" "$LEGACY_FIREWALL" "$SYSCTL_FILE"
+    sysctl --system >/dev/null 2>&1 || true
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl reset-failed >/dev/null 2>&1 || true
+}
+uninstall_command() { rm -f "$SELF_BIN"; }
 uninstall_proxy() {
-    banner
-    echo
-    msg warn 'This will remove TDZ Payload Proxy completely.'
+    local answer
+    banner; echo
+    msg warn 'This will remove every TDZ Payload Proxy.'
     read -r -p '  Type YES to continue: ' answer
     [[ "$answer" == YES ]] || { msg info 'Uninstall cancelled.'; pause_screen; return; }
-
     echo
-    printf '  [1/4] Stopping service... '
-    systemctl disable --now "$SERVICE_NAME" >/dev/null 2>&1 || true
-    printf '%bDONE%b\n' "$GREEN" "$RESET"
-    printf '  [2/4] Removing firewall rule... '
-    firewall_remove_from_file "$FIREWALL_FILE"
-    printf '%bDONE%b\n' "$GREEN" "$RESET"
-    printf '  [3/4] Removing settings... '
-    rm -f "$SERVICE_FILE" "$CONFIG_FILE" "$FIREWALL_FILE" "$SYSCTL_FILE"
-    sysctl --system >/dev/null 2>&1 || true
-    printf '%bDONE%b\n' "$GREEN" "$RESET"
-    printf '  [4/4] Removing command... '
-    systemctl daemon-reload >/dev/null 2>&1 || true
-    rm -f "$SELF_BIN"
-    printf '%bDONE%b\n' "$GREEN" "$RESET"
+    spinner_run 'Stopping all proxy services' uninstall_stop_all
+    spinner_run 'Removing firewall rules' uninstall_firewalls
+    spinner_run 'Removing proxy settings' uninstall_settings
+    spinner_run 'Removing TDZP command' uninstall_command
     echo
     msg ok 'TDZ Payload Proxy has been uninstalled.'
     exit 0
 }
-
 menu() {
     require_root
-    [[ -r "$CONFIG_FILE" ]] || { msg error 'TDZ Payload Proxy is not installed.'; exit 1; }
+    ensure_layout
     while true; do
-        local public backend state choice
-        public=$(config_get PUBLIC_PORT)
-        backend=$(config_get BACKEND_PORT)
-        if service_active; then state="${GREEN}ACTIVE${RESET}"; else state="${RED}INACTIVE${RESET}"; fi
+        local total active choice
+        total=$(instance_count)
+        active=$(active_count)
         banner
         echo
-        printf '  Service: %b   Public: %s   Backend: %s\n' "$state" "$public" "$backend"
+        printf '  Proxies: %b%s%b   Active: %b%s%b\n' "$CYAN" "$total" "$RESET" "$GREEN" "$active" "$RESET"
         line
-        printf '  %b[1]%b Edit Public Port\n' "$CYAN" "$RESET"
-        printf '  %b[2]%b Edit Backend Port\n' "$CYAN" "$RESET"
-        printf '  %b[3]%b View Status\n' "$CYAN" "$RESET"
+        printf '  %b[1]%b Create New Proxy\n' "$CYAN" "$RESET"
+        printf '  %b[2]%b Proxy List\n' "$CYAN" "$RESET"
         printf '  %b[0]%b Exit\n' "$GRAY" "$RESET"
         line
         printf '  %b[99]%b Uninstall\n' "$RED" "$RESET"
         echo
         read -r -p '  Select option: ' choice
         case "$choice" in
-            1) change_port public ;;
-            2) change_port backend ;;
-            3) show_status ;;
+            1) create_proxy_screen ;;
+            2) proxy_list_screen ;;
             99) uninstall_proxy ;;
             0) exit 0 ;;
             *) msg error 'Invalid option.'; sleep 1 ;;
@@ -417,10 +632,13 @@ menu() {
 }
 
 case "${1:-}" in
-    --run-proxy) run_proxy ;;
-    --setup) shift; setup_proxy "${1:-}" "${2:-}" ;;
-    --status) require_root; show_status ;;
+    --run-proxy) shift; run_proxy "${1:-}" ;;
+    --prepare) prepare_system ;;
+    --migrate) prepare_system; migrate_legacy ;;
+    --create) shift; create_instance "${1:-}" "${2:-}"; printf '%s\n' "$CREATED_ID" ;;
+    --has-instances) (( $(instance_count) > 0 )) ;;
+    --count) instance_count ;;
     --version) printf 'TDZ Payload Proxy %s\n' "$VERSION" ;;
     '') menu ;;
-    *) printf 'Usage: tdzp [--status|--version]\n' >&2; exit 2 ;;
+    *) printf 'Usage: tdzp [--version]\n' >&2; exit 2 ;;
 esac
