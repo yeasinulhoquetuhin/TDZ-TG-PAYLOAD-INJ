@@ -30,7 +30,7 @@ banner() {
     [[ -t 1 ]] && clear || true
     echo
     printf '  %b╔%s╗%b\n' "$CYAN" "$(repeat_char '═' "$BOX_WIDTH")" "$RESET"
-    center_line 'TDZ PAYLOAD PROXY' "${BOLD}${CYAN}"
+    center_line 'TDZ PAYLOAD PROXY INJECT' "${BOLD}${CYAN}"
     center_line 'Powered By: t.me/TuhinBroh' "$GRAY"
     printf '  %b╚%s╝%b\n' "$CYAN" "$(repeat_char '═' "$BOX_WIDTH")" "$RESET"
 }
