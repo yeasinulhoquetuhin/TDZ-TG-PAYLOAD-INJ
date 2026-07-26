@@ -1,0 +1,46 @@
+TDZ PAYLOAD PROXY v1.0.1 - VALIDATION REPORT
+============================================================
+
+Scope
+-----
+Single public port -> single local backend port.
+HTTP payload header -> 101 Switching Protocols -> raw TCP relay.
+
+Checks
+------
+[PASS] install.sh Bash syntax
+[PASS] manager.sh Bash syntax
+[PASS] Python compilation
+[PASS] HTTP Upgrade response
+[PASS] Inline payload forwarding
+[PASS] Fragmented header handling
+[PASS] Bidirectional binary relay
+[PASS] 12 concurrent clients
+[PASS] Incomplete-header cleanup
+[PASS] Port validation
+[PASS] Manager public-port edit in sandbox
+[PASS] Manager backend-port edit in sandbox
+[PASS] Manager status screen in sandbox
+[PASS] Complete manager uninstall in sandbox
+[PASS] Branding/menu constraint checks
+[PASS] Removed old owner and Telegram-bypass wording
+[PASS] Removed multi-instance and payload-mode menus
+
+Automated test output
+---------------------
+test_bidirectional_binary_relay (tests.test_payload_proxy.PayloadProxyTests.test_bidirectional_binary_relay) ... ok
+test_concurrent_clients (tests.test_payload_proxy.PayloadProxyTests.test_concurrent_clients) ... ok
+test_fragmented_header (tests.test_payload_proxy.PayloadProxyTests.test_fragmented_header) ... ok
+test_incomplete_header_is_closed (tests.test_payload_proxy.PayloadProxyTests.test_incomplete_header_is_closed) ... ok
+test_upgrade_response_and_inline_payload (tests.test_payload_proxy.PayloadProxyTests.test_upgrade_response_and_inline_payload) ... ok
+test_invalid_port (tests.test_payload_proxy.ValidationTests.test_invalid_port) ... ok
+test_valid_port (tests.test_payload_proxy.ValidationTests.test_valid_port) ... ok
+
+----------------------------------------------------------------------
+Ran 7 tests in 0.094s
+
+OK
+Manager sandbox checks passed.
+All package checks passed.
+
+Branding banner: PASS (two centered lines only; legacy tagline removed)
