@@ -406,12 +406,12 @@ show_proxy_card() {
 prompt_pair() {
     local public backend
     while true; do
-        read -r -p '  Select Public Port: ' public
+        read -r -p '  Choose Public Port: ' public
         valid_port "$public" || { msg error 'Invalid port. Use 1-65535.'; continue; }
         break
     done
     while true; do
-        read -r -p '  Select Backend Port: ' backend
+        read -r -p '  Choose Backend Port: ' backend
         valid_port "$backend" || { msg error 'Invalid port. Use 1-65535.'; continue; }
         validate_pair "$public" "$backend" || continue
         break
