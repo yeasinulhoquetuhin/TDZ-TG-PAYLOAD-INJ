@@ -91,12 +91,12 @@ fi
 
 echo
 while true; do
-    read -r -p '  Select Public Port: ' PUBLIC_PORT
+    read -r -p '  Choose Public Port: ' PUBLIC_PORT
     valid_port "$PUBLIC_PORT" && break
     printf '  %bInvalid port. Use 1-65535.%b\n' "$RED" "$RESET"
 done
 while true; do
-    read -r -p '  Select Backend Port: ' BACKEND_PORT
+    read -r -p '  Choose Backend Port: ' BACKEND_PORT
     valid_port "$BACKEND_PORT" || { printf '  %bInvalid port. Use 1-65535.%b\n' "$RED" "$RESET"; continue; }
     [[ "$BACKEND_PORT" != "$PUBLIC_PORT" ]] || { printf '  %bPorts must be different.%b\n' "$RED" "$RESET"; continue; }
     break
